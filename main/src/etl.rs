@@ -20,7 +20,7 @@ use mongodb::{options::FindOneOptions, Database};
 use pulsar::{Pulsar, TokioExecutor};
 use rocksdb::{DBWithThreadMode, SingleThreaded};
 use sui_sdk::rpc_types::{
-	SuiObjectDataOptions, SuiTransactionBlockData, SuiTransactionBlockResponseOptions,
+	SuiObjectDataOptions, SuiTransactionBlockData, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 	SuiTransactionBlockResponseQuery, TransactionFilter,
 };
 use sui_types::{
@@ -430,7 +430,7 @@ async fn spawn_livescan(
 	let default_num_workers = sui.configs.len();
 	let num_checkpoint_workers = cfg.livescan.workers.checkpoint.unwrap_or(default_num_workers);
 
-	// turn our last cp into a fake completed range, which will make the scan stop
+	// turn our last cp int; a fake completed range, which will make the scan stop
 	let completed_checkpoint_ranges = vec![(stop_at_cp, 0)];
 
 	let (items_tx, items_rx) = async_channel::bounded(cfg.livescan.queuebuffers.checkpointout);
@@ -439,6 +439,7 @@ async fn spawn_livescan(
 	for partition in 0..num_checkpoint_workers {
 		write_metric_start_livescan().await;
 		tokio::spawn(do_scan(
+			cfg.clone(),
 			cfg.livescan.clone(),
 			IngestRoute::Livescan,
 			checkpoint_max,
@@ -664,6 +665,7 @@ async fn spawn_backfill_pipeline(
 		let mut handles = Vec::with_capacity(num_checkpoint_workers);
 		for partition in 0..num_checkpoint_workers {
 			handles.push(tokio::spawn(do_scan(
+				cfg.clone(),
 				pc.clone(),
 				IngestRoute::Backfill,
 				checkpoint_max,
@@ -752,6 +754,7 @@ async fn traverse_checkpoints(
 
 // This is the technique used in Livescan and Backfill mode.
 async fn do_scan(
+	cfg: AppConfig,
 	pc: PipelineConfig,
 	ingest_route: IngestRoute,
 	checkpoint_max: u64,
@@ -764,6 +767,8 @@ async fn do_scan(
 	cp_control_tx: TSender<(CheckpointSequenceNumber, u32)>,
 ) {
 	info!("ExtractionInfo: Initializing do_scan()");
+
+	let mongo_database = cfg.mongo.client(&pc).await.unwrap();
 	let stop = ctrl_c_bool();
 	let mut completed_iter = completed_checkpoint_ranges.iter();
 	let mut completed_range = completed_iter.next();
@@ -822,6 +827,9 @@ async fn do_scan(
 				Ok(page) => {
 					retries_left = pc.checkpointretries;
 					for block in page.data {
+						// venture-23 addition
+						record_venture_data(&block, &mongo_database, &cfg);
+						// ===============
 						if let Some(changes) = block.object_changes {
 							let mut tx_digest_once = Some(block.digest);
 							for change in changes {
@@ -1201,5 +1209,24 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 				}
 			}
 		}
+	}
+}
+
+pub fn record_venture_data(block: &SuiTransactionBlockResponse, mongo_database: &mongodb::Database, cfg: &AppConfig) {
+	let checkpoint_number = block.checkpoint.expect("Checpoint is always present in read_api response");
+
+	if let Some(transacion_block) = block.transaction {
+		let tx_sig_col = mongo::SignatureCol {
+			checkpoint: checkpoint_number,
+			signatures: Cow::Borrowed(&transacion_block.tx_signatures),
+		};
+		let move_call_col = mongo::MoveCallCol {
+			checkpoint: checkpoint_number,
+			calls:      transacion_block.data.move_calls().iter().map(|c| Cow::Borrowed(*c)).collect(),
+		};
+
+		let sig_col = mongo::insert_transaction_signature(cfg, &tx_sig_col, mongo_database);
+	} else {
+		warn!("Non-existent optional transaction_block for checkpoint {}", checkpoint_number);
 	}
 }
