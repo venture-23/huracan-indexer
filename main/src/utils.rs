@@ -1,6 +1,6 @@
 use std::str::FromStr;
-use sui_types::base_types::ObjectType;
 
+use sui_types::base_types::ObjectType;
 
 /// ranges are inclusive on both sides
 pub fn make_descending_ranges(mut numbers: Vec<u64>) -> Vec<(u64, u64)> {

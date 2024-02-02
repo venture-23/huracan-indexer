@@ -35,7 +35,9 @@ pub fn with_client_rotation(_attr: proc_macro::TokenStream, item: proc_macro::To
 		#[async_recursion::async_recursion]
 	});
 
-	let Stmt::Expr(call, _) = block.stmts[0].clone() else { panic!("body of function must be an expression like `some_sui_api_call(... args ...).await`!")};
+	let Stmt::Expr(call, _) = block.stmts[0].clone() else {
+		panic!("body of function must be an expression like `some_sui_api_call(... args ...).await`!")
+	};
 
 	let code = quote! {
 		#(#attrs)* #vis #sig {

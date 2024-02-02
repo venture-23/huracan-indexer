@@ -1,4 +1,5 @@
 use std::time::Duration;
+
 use macros::with_client_rotation;
 use sui_sdk::{
 	apis::ReadApi,
@@ -11,14 +12,17 @@ use sui_sdk::{
 };
 use sui_types::{
 	base_types::{ObjectID, SequenceNumber, TransactionDigest, VersionNumber},
+	error::SuiObjectResponseError::*,
 	messages_checkpoint::CheckpointSequenceNumber,
 };
-use sui_types::error::SuiObjectResponseError::*;
 use tokio::time::Instant;
-use crate::{_prelude::*, conf::RpcProviderConfig, utils::check_obj_type_from_string_vec};
-use crate::conf::get_config_singleton;
-use crate::influx::{write_metric_ingest_error, get_influx_timestamp_as_milliseconds, write_metric_rpc_request};
 
+use crate::{
+	_prelude::*,
+	conf::{get_config_singleton, RpcProviderConfig},
+	influx::{get_influx_timestamp_as_milliseconds, write_metric_ingest_error, write_metric_rpc_request},
+	utils::check_obj_type_from_string_vec,
+};
 
 #[derive(Clone)]
 pub struct ClientPool {
@@ -136,7 +140,8 @@ pub async fn parse_get_object_response(id: &ObjectID, res: SuiObjectResponse) ->
 			}
 			ref _e @ DynamicFieldNotFound { parent_object_id } => {
 				warn!(parent_object_id = ?parent_object_id, "DynamicFieldNotFound error.");
-				write_metric_ingest_error("unknown".to_string(), "sui_object_dynamic_field_not_found".to_string()).await;
+				write_metric_ingest_error("unknown".to_string(), "sui_object_dynamic_field_not_found".to_string())
+					.await;
 			}
 		};
 		return None
@@ -155,14 +160,20 @@ pub async fn parse_get_object_response(id: &ObjectID, res: SuiObjectResponse) ->
 			return Some((obj.version, bytes))
 		}
 		// Index only whitelisted objects.
-		if whitelist_packages != None && whitelist_enabled == true && check_obj_type_from_string_vec(&obj_type, whitelist_packages.unwrap()) == true {
+		if whitelist_packages != None
+			&& whitelist_enabled == true
+			&& check_obj_type_from_string_vec(&obj_type, whitelist_packages.unwrap()) == true
+		{
 			let mut bytes = Vec::with_capacity(4096);
 			let bson = bson::to_bson(&obj).unwrap();
 			bson.as_document().unwrap().to_writer(&mut bytes).unwrap();
 			return Some((obj.version, bytes))
 		}
 		// Index everything except blacklisted objects.
-		if blacklist_packages != None && blacklist_enabled == true && check_obj_type_from_string_vec(&obj_type, blacklist_packages.unwrap()) == false {
+		if blacklist_packages != None
+			&& blacklist_enabled == true
+			&& check_obj_type_from_string_vec(&obj_type, blacklist_packages.unwrap()) == false
+		{
 			let mut bytes = Vec::with_capacity(4096);
 			let bson = bson::to_bson(&obj).unwrap();
 			bson.as_document().unwrap().to_writer(&mut bytes).unwrap();

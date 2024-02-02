@@ -91,8 +91,8 @@ pub struct PulsarConfig {
 #[serde(deny_unknown_fields)]
 pub struct InfluxConfig {
 	pub database: String,
-	pub token: String,
-	pub url: String,
+	pub token:    String,
+	pub url:      String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -234,11 +234,13 @@ pub fn get_config_singleton() -> &'static AppConfig {
 pub(crate) static INFLUXCLIENT: OnceCell<influxdb::Client> = OnceCell::const_new();
 
 pub async fn setup_influx_singleton() -> &'static influxdb::Client {
-	INFLUXCLIENT.get_or_init(|| async {
-		let influxconfig = get_config_singleton().influx.clone();
-		let client = Client::new(influxconfig.url, influxconfig.database).with_token(influxconfig.token);
-		return client;
-	}).await
+	INFLUXCLIENT
+		.get_or_init(|| async {
+			let influxconfig = get_config_singleton().influx.clone();
+			let client = Client::new(influxconfig.url, influxconfig.database).with_token(influxconfig.token);
+			return client;
+		})
+		.await
 }
 
 pub fn get_influx_singleton() -> &'static influxdb::Client {

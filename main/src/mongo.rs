@@ -1,11 +1,17 @@
+use std::borrow::Cow;
+
 use bson::doc;
 use influxdb::InfluxDbWriteable;
 use mongodb::Database;
-use sui_types::messages_checkpoint::CheckpointSequenceNumber;
+use sui_sdk::rpc_types::{
+	SuiProgrammableMoveCall, SuiTransactionBlock, SuiTransactionBlockData, SuiTransactionBlockDataV1,
+};
+use sui_types::{messages_checkpoint::CheckpointSequenceNumber, signature::GenericSignature};
 
-use crate::_prelude::*;
-use crate::influx::{write_metric_checkpoint_error, write_metric_create_checkpoint, write_metric_mongo_write_error};
-
+use crate::{
+	_prelude::*,
+	influx::{write_metric_checkpoint_error, write_metric_create_checkpoint, write_metric_mongo_write_error},
+};
 
 #[derive(Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -55,4 +61,58 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 		write_metric_create_checkpoint(cp as u64).await;
 		break
 	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureCol<'a> {
+	pub checkpoint: CheckpointSequenceNumber,
+	pub signatures: Cow<'a, Vec<GenericSignature>>,
+}
+
+pub async fn insert_transaction_signature(
+	cfg: &AppConfig,
+	signatures: &SignatureCol<'_>,
+	db: &Database,
+) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
+	let collection = db.collection::<SignatureCol>(&mongo_collection_name(cfg, "_signatures"));
+
+	// TODO: why do we need retries?
+	//
+	collection.insert_one(signatures, None).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveCallCol<'a> {
+	pub checkpoint: CheckpointSequenceNumber,
+	pub calls:      Vec<Cow<'a, SuiProgrammableMoveCall>>,
+}
+pub async fn insert_move_calls(
+	cfg: &AppConfig,
+	calls: &MoveCallCol<'_>,
+	db: &Database,
+) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
+	let collection = db.collection::<MoveCallCol>(&mongo_collection_name(cfg, "_move_calls"));
+
+	collection.insert_one(calls, None).await
+}
+
+// TODO:
+// Do we need this BlockDataCol/insert_transaction_block_data?
+// we already have signature and move_calls recorded. so this might not be needed
+#[allow(unused)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockDataCol<'a> {
+	pub checkpoint: CheckpointSequenceNumber,
+	pub block:      Cow<'a, SuiTransactionBlockDataV1>,
+}
+
+#[allow(unused)]
+pub async fn insert_transaction_block_data(
+	cfg: &AppConfig,
+	block: &BlockDataCol<'_>,
+	db: &Database,
+) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
+	let collection = db.collection::<BlockDataCol>(&mongo_collection_name(cfg, "_blocks"));
+
+	collection.insert_one(block, None).await
 }
