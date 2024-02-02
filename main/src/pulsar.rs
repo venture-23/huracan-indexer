@@ -31,17 +31,6 @@ pub async fn make_transaction_producer(topic_suffix: &str ) -> anyhow::Result<Pr
         .await?)
 }
 
-pub async fn create(cfg: &AppConfig) -> anyhow::Result<Pulsar<TokioExecutor>> {
-	Ok(Pulsar::builder(&cfg.pulsar.url, TokioExecutor)
-		.with_auth_provider(OAuth2Authentication::client_credentials(OAuth2Params {
-			issuer_url:      cfg.pulsar.issuer.clone(),
-			credentials_url: cfg.pulsar.credentials.to_string().clone(),
-			audience:        Some(cfg.pulsar.audience.clone()),
-			scope:           None,
-		}))
-		.build()
-		.await?)
-}
 
 pub(crate) static PULSARCLIENT: OnceCell<Pulsar<TokioExecutor>> = OnceCell::const_new();
 
@@ -50,12 +39,12 @@ pub async fn setup_pulsar_singleton() -> &'static Pulsar<TokioExecutor> {
 	let cfg = get_config_singleton();
 	PULSARCLIENT.get_or_init(|| async {
 		Pulsar::builder(&cfg.pulsar.url, TokioExecutor)
-			   .with_auth_provider(OAuth2Authentication::client_credentials(OAuth2Params {
-				   issuer_url:      cfg.pulsar.issuer.clone(),
-				   credentials_url: cfg.pulsar.credentials.to_string().clone(),
-				   audience:        Some(cfg.pulsar.audience.clone()),
-				   scope:           None,
-			   }))
+			   // .with_auth_provider(OAuth2Authentication::client_credentials(OAuth2Params {
+				  //  issuer_url:      cfg.pulsar.issuer.clone(),
+				  //  credentials_url: cfg.pulsar.credentials.to_string().clone(),
+				  //  audience:        Some(cfg.pulsar.audience.clone()),
+				  //  scope:           None,
+			   // }))
 			   .build()
 			   .await.unwrap()
 	}).await
