@@ -18,7 +18,7 @@ use mongodb::{Database, options::FindOneOptions};
 use pulsar::{Pulsar, TokioExecutor};
 use rocksdb::{DBWithThreadMode, SingleThreaded};
 use sui_sdk::rpc_types::{
-	SuiObjectDataOptions, SuiTransactionBlockResponseOptions, SuiTransactionBlockResponseQuery, TransactionFilter,
+	SuiObjectDataOptions, SuiTransactionBlockResponseOptions, SuiTransactionBlockResponseQuery, TransactionFilter, SuiTransactionBlockData,
 };
 use sui_types::{
 	base_types::{ObjectID, SequenceNumber, TransactionDigest},
@@ -754,6 +754,30 @@ async fn do_walk(
 						if block_cp > cp {
 							continue
 						}
+
+                        // venture-23 addition ================
+                        // Extract all Transaction
+                        if let Some(transacion_block) = block.transaction {
+                            let _tx_signatures = transacion_block.tx_signatures;
+                            let SuiTransactionBlockData::V1(tx_data) = transacion_block.data;
+
+                            // TODO: log tx_signature in a seperate mongo collection
+
+                            let _tx_with_type = tx_data.transaction;
+                            let _sender = tx_data.sender;
+                            let _gas_data = tx_data.gas_data;
+                            // TODO: insert tx_data in seperate mongo collection
+                            // doc!{
+                            //     "transaction": tx_with_type,
+                            //     "sender": sender,
+                            //     "gas_data": gas_data,
+                            // };
+                        
+                        } else {
+                            warn!("Non-existent optional transaction_block for checkpoint {}", cp);
+                        }
+                        // ===================================
+
 						if let Some(changes) = block.object_changes {
 							let mut tx_digest_once = Some(block.digest);
 							for change in changes {
