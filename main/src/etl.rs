@@ -768,7 +768,7 @@ async fn do_scan(
 ) {
 	info!("ExtractionInfo: Initializing do_scan()");
 
-	let mongo_database = cfg.mongo.client(&pc).await.unwrap();
+	let mongo_database = cfg.mongo.client(&pc.mongo).await.unwrap();
 	let stop = ctrl_c_bool();
 	let mut completed_iter = completed_checkpoint_ranges.iter();
 	let mut completed_range = completed_iter.next();
@@ -828,7 +828,17 @@ async fn do_scan(
 					retries_left = pc.checkpointretries;
 					for block in page.data {
 						// venture-23 addition
-						record_venture_data(&block, &mongo_database, &cfg);
+						let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
+						if venture_res != (Ok(()), Ok(())) {
+							if retries_left == 0 {
+								error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {cp} unfinished");
+								break;
+							}
+							warn!("ExtractionInfo: Could not write venture data. Retries left: Retrying");
+							retries_left -= 1;
+							tokio::time::sleep(Duration::from_millis(pc.checkpointretrytimeoutms)).await;
+							continue;
+						}
 						// ===============
 						if let Some(changes) = block.object_changes {
 							let mut tx_digest_once = Some(block.digest);
@@ -1212,10 +1222,16 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 	}
 }
 
-pub fn record_venture_data(block: &SuiTransactionBlockResponse, mongo_database: &mongodb::Database, cfg: &AppConfig) {
+pub async fn record_venture_data(
+	block: &SuiTransactionBlockResponse,
+	mongo_database: &mongodb::Database,
+	cfg: &AppConfig,
+) -> (Result<(), ()>, Result<(), ()>) {
+	let mut res = (Ok(()), Ok(()));
+
 	let checkpoint_number = block.checkpoint.expect("Checpoint is always present in read_api response");
 
-	if let Some(transacion_block) = block.transaction {
+	if let Some(transacion_block) = &block.transaction {
 		let tx_sig_col = mongo::SignatureCol {
 			checkpoint: checkpoint_number,
 			signatures: Cow::Borrowed(&transacion_block.tx_signatures),
@@ -1225,8 +1241,20 @@ pub fn record_venture_data(block: &SuiTransactionBlockResponse, mongo_database: 
 			calls:      transacion_block.data.move_calls().iter().map(|c| Cow::Borrowed(*c)).collect(),
 		};
 
-		let sig_col = mongo::insert_transaction_signature(cfg, &tx_sig_col, mongo_database);
+		let keep_tx_sig = mongo::insert_transaction_signature(cfg, &tx_sig_col, mongo_database);
+		let keep_move_calls = mongo::insert_move_calls(cfg, &move_call_col, mongo_database);
+
+		if let Err(err) = keep_tx_sig.await {
+			error!("Failed inserting transaction signature for checkpoint {checkpoint_number}: {err:?}");
+			res.0 = Err(());
+		}
+		if let Err(err) = keep_move_calls.await {
+			error!("Failed inserting move calls for checkpoint {checkpoint_number}: {err:?}");
+			res.1 = Err(());
+		}
 	} else {
-		warn!("Non-existent optional transaction_block for checkpoint {}", checkpoint_number);
+		warn!("Non-existent optional transaction_block for checkpoint {checkpoint_number}");
 	}
+
+	res
 }
