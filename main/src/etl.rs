@@ -814,7 +814,7 @@ async fn do_scan(
 		// start fetching all tx blocks for this checkpoint
 		let q = SuiTransactionBlockResponseQuery::new(
 			Some(TransactionFilter::Checkpoint(cp as CheckpointSequenceNumber)),
-			Some(SuiTransactionBlockResponseOptions::new().with_object_changes()),
+			Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input()),
 		);
 		let mut cursor = None;
 		let mut retries_left = pc.checkpointretries;
