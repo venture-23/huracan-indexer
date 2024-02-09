@@ -978,6 +978,7 @@ async fn do_poll(
 
 				checkpoints.clear();
 				for block in page.data {
+					println!("[+] Fround checkoint {:?} from do_pool", block.checkpoint);
 					// if we found a new (to this iteration) checkpoint, we want to let the checkpoints-based
 					// processor know immediately
 					// we also skip those items here, so we don't need to coordinate with it
@@ -1230,6 +1231,10 @@ pub async fn record_venture_data(
 	let mut res = (Ok(()), Ok(()));
 
 	let checkpoint_number = block.checkpoint.expect("Checpoint is always present in read_api response");
+	println!(
+		"Block: {checkpoint_number}======\n{:?}\n===============\n",
+		block.transaction.clone().map(|a| a.tx_signatures)
+	);
 
 	if let Some(transacion_block) = &block.transaction {
 		let tx_sig_col = mongo::SignatureCol {

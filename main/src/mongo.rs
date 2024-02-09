@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bson::doc;
 use influxdb::InfluxDbWriteable;
-use mongodb::Database;
+use mongodb::{Database, options::UpdateOptions};
 use sui_sdk::rpc_types::{
 	SuiProgrammableMoveCall, SuiTransactionBlock, SuiTransactionBlockData, SuiTransactionBlockDataV1,
 };
@@ -73,12 +73,35 @@ pub async fn insert_transaction_signature(
 	cfg: &AppConfig,
 	signatures: &SignatureCol<'_>,
 	db: &Database,
-) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
+) -> mongodb::error::Result<mongodb::results::UpdateResult> {
 	let collection = db.collection::<SignatureCol>(&mongo_collection_name(cfg, "_signatures"));
+
+	// TODO: CRTICIAL:
+	// figure out way to insert u64
+	let signatures_bson = bson::Bson::Array(
+		signatures
+			.signatures
+			.as_slice()
+			.iter()
+			.map(|sig| bson::Bson::Array(sig.as_ref().iter().map(|ch| bson::Bson::from(*ch as i32)).collect::<Vec<_>>()))
+			.collect::<Vec<_>>(),
+	);
+	let filter = doc! { "checkpoint": signatures.checkpoint as i64 };
+	let update = doc! { "$push": {"signatures": { "$each": signatures_bson}  }};
 
 	// TODO: why do we need retries?
 	//
-	collection.insert_one(signatures, None).await
+    println!("Filter: {filter:?} and update: {update:?}");
+	let res = collection.update_one(filter, update, None).await;
+    println!("Result: {res:?}");
+    if let Ok(r) = &res {
+        if r.matched_count == 0 {
+            println!("No updates. Inserting..");
+            let insert_res = collection.insert_one(signatures, None).await;
+            println!("INSERT RES: {insert_res:?}");
+        }
+    }
+    res
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
