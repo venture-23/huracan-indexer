@@ -2,11 +2,14 @@ use std::borrow::Cow;
 
 use bson::doc;
 use influxdb::InfluxDbWriteable;
-use mongodb::{Database, options::UpdateOptions};
+use mongodb::{options::UpdateOptions, Database};
 use sui_sdk::rpc_types::{
 	SuiProgrammableMoveCall, SuiTransactionBlock, SuiTransactionBlockData, SuiTransactionBlockDataV1,
+	SuiTransactionBlockResponse,
 };
-use sui_types::{messages_checkpoint::CheckpointSequenceNumber, signature::GenericSignature};
+use sui_types::{
+	digests::TransactionDigest, messages_checkpoint::CheckpointSequenceNumber, signature::GenericSignature,
+};
 
 use crate::{
 	_prelude::*,
@@ -83,7 +86,9 @@ pub async fn insert_transaction_signature(
 			.signatures
 			.as_slice()
 			.iter()
-			.map(|sig| bson::Bson::Array(sig.as_ref().iter().map(|ch| bson::Bson::from(*ch as i32)).collect::<Vec<_>>()))
+			.map(|sig| {
+				bson::Bson::Array(sig.as_ref().iter().map(|ch| bson::Bson::from(*ch as i32)).collect::<Vec<_>>())
+			})
 			.collect::<Vec<_>>(),
 	);
 	let filter = doc! { "checkpoint": signatures.checkpoint as i64 };
@@ -91,17 +96,17 @@ pub async fn insert_transaction_signature(
 
 	// TODO: why do we need retries?
 	//
-    println!("Filter: {filter:?} and update: {update:?}");
+	println!("Filter: {filter:?} and update: {update:?}");
 	let res = collection.update_one(filter, update, None).await;
-    println!("Result: {res:?}");
-    if let Ok(r) = &res {
-        if r.matched_count == 0 {
-            println!("No updates. Inserting..");
-            let insert_res = collection.insert_one(signatures, None).await;
-            println!("INSERT RES: {insert_res:?}");
-        }
-    }
-    res
+	println!("Result: {res:?}");
+	if let Ok(r) = &res {
+		if r.matched_count == 0 {
+			println!("No updates. Inserting..");
+			let insert_res = collection.insert_one(signatures, None).await;
+			println!("INSERT RES: {insert_res:?}");
+		}
+	}
+	res
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,23 +124,50 @@ pub async fn insert_move_calls(
 	collection.insert_one(calls, None).await
 }
 
-// TODO:
-// Do we need this BlockDataCol/insert_transaction_block_data?
-// we already have signature and move_calls recorded. so this might not be needed
-#[allow(unused)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockDataCol<'a> {
+pub struct BlockDataCol {
 	pub checkpoint: CheckpointSequenceNumber,
-	pub block:      Cow<'a, SuiTransactionBlockDataV1>,
+	pub blocks:     Vec<SuiTransactionBlockResponse>,
 }
 
-#[allow(unused)]
 pub async fn insert_transaction_block_data(
 	cfg: &AppConfig,
-	block: &BlockDataCol<'_>,
+	block: &BlockDataCol,
 	db: &Database,
-) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
+) -> Result<(), mongodb::error::Error> {
 	let collection = db.collection::<BlockDataCol>(&mongo_collection_name(cfg, "_blocks"));
 
-	collection.insert_one(block, None).await
+	let blocks_bson = bson::Bson::Array(
+		block
+			.blocks
+			.iter()
+			.map(|bl| {
+				let as_bson = bson::to_bson(bl).unwrap();
+				as_bson
+			})
+			.collect::<Vec<_>>(),
+	);
+
+	// TODO: CRITICAL:
+	// Inserting with conversion to i64 is not ideal. WIll occur overflow
+	let filter = doc! { "checkpoint": block.checkpoint as i64 };
+	let update = doc! { "$push": { "blocks": { "$each": blocks_bson  } } };
+
+	let push_res = collection.update_one(filter, update, None).await;
+
+    if let Ok(push_res) = push_res {
+        // check if the filter matched any record. if not this means, this is the first
+        // record for given checkpoint. So just insert it
+        if push_res.matched_count == 0 {
+            info!("Found first digest for checkpoint: {}", block.checkpoint);
+            collection.insert_one(block, None).await?;
+            Ok(())
+        } else {
+            // some record have been updated
+            Ok(())
+        }
+    } else {
+        push_res?;
+        unreachable!()
+    }
 }
