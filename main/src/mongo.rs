@@ -67,64 +67,6 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignatureCol<'a> {
-	pub checkpoint: CheckpointSequenceNumber,
-	pub signatures: Cow<'a, Vec<GenericSignature>>,
-}
-
-pub async fn insert_transaction_signature(
-	cfg: &AppConfig,
-	signatures: &SignatureCol<'_>,
-	db: &Database,
-) -> mongodb::error::Result<mongodb::results::UpdateResult> {
-	let collection = db.collection::<SignatureCol>(&mongo_collection_name(cfg, "_signatures"));
-
-	// TODO: CRTICIAL:
-	// figure out way to insert u64
-	let signatures_bson = bson::Bson::Array(
-		signatures
-			.signatures
-			.as_slice()
-			.iter()
-			.map(|sig| {
-				bson::Bson::Array(sig.as_ref().iter().map(|ch| bson::Bson::from(*ch as i32)).collect::<Vec<_>>())
-			})
-			.collect::<Vec<_>>(),
-	);
-	let filter = doc! { "checkpoint": signatures.checkpoint as i64 };
-	let update = doc! { "$push": {"signatures": { "$each": signatures_bson}  }};
-
-	// TODO: why do we need retries?
-	//
-	println!("Filter: {filter:?} and update: {update:?}");
-	let res = collection.update_one(filter, update, None).await;
-	println!("Result: {res:?}");
-	if let Ok(r) = &res {
-		if r.matched_count == 0 {
-			println!("No updates. Inserting..");
-			let insert_res = collection.insert_one(signatures, None).await;
-			println!("INSERT RES: {insert_res:?}");
-		}
-	}
-	res
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoveCallCol<'a> {
-	pub checkpoint: CheckpointSequenceNumber,
-	pub calls:      Vec<Cow<'a, SuiProgrammableMoveCall>>,
-}
-pub async fn insert_move_calls(
-	cfg: &AppConfig,
-	calls: &MoveCallCol<'_>,
-	db: &Database,
-) -> mongodb::error::Result<mongodb::results::InsertOneResult> {
-	let collection = db.collection::<MoveCallCol>(&mongo_collection_name(cfg, "_move_calls"));
-
-	collection.insert_one(calls, None).await
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockDataCol {
 	pub checkpoint: CheckpointSequenceNumber,
 	pub blocks:     Vec<SuiTransactionBlockResponse>,
@@ -141,11 +83,9 @@ pub async fn insert_transaction_block_data(
 		block
 			.blocks
 			.iter()
-			.map(|bl| {
-				let as_bson = bson::to_bson(bl).unwrap();
-				as_bson
-			})
-			.collect::<Vec<_>>(),
+			.map(bson::to_bson)
+			.collect::<bson::ser::Result<Vec<_>>>()
+			.map_err(mongodb::error::ErrorKind::BsonSerialization)?,
 	);
 
 	// TODO: CRITICAL:
@@ -155,19 +95,19 @@ pub async fn insert_transaction_block_data(
 
 	let push_res = collection.update_one(filter, update, None).await;
 
-    if let Ok(push_res) = push_res {
-        // check if the filter matched any record. if not this means, this is the first
-        // record for given checkpoint. So just insert it
-        if push_res.matched_count == 0 {
-            info!("Found first digest for checkpoint: {}", block.checkpoint);
-            collection.insert_one(block, None).await?;
-            Ok(())
-        } else {
-            // some record have been updated
-            Ok(())
-        }
-    } else {
-        push_res?;
-        unreachable!()
-    }
+	if let Ok(push_res) = push_res {
+		// check if the filter matched any record. if not this means, this is the first
+		// record for given checkpoint. So just insert it
+		if push_res.matched_count == 0 {
+			info!("Found first digest for checkpoint: {}", block.checkpoint);
+			collection.insert_one(block, None).await?;
+			Ok(())
+		} else {
+			// some record have been updated
+			Ok(())
+		}
+	} else {
+		push_res?;
+		unreachable!()
+	}
 }

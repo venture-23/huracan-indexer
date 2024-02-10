@@ -1233,29 +1233,4 @@ pub async fn record_venture_data(
 	let block_col = mongo::BlockDataCol { checkpoint: checkpoint_number, blocks: vec![block.clone()] };
 	let keep_block_res = mongo::insert_transaction_block_data(cfg, &block_col, mongo_database).await;
 	keep_block_res.map(|_| ()).map_err(|_| ())
-
-	// if let Some(transacion_block) = &block.transaction {
-	// let tx_sig_col = mongo::SignatureCol {
-	// 	checkpoint: checkpoint_number,
-	// 	signatures: Cow::Borrowed(&transacion_block.tx_signatures),
-	// };
-	// let move_call_col = mongo::MoveCallCol {
-	// 	checkpoint: checkpoint_number,
-	// 	calls:      transacion_block.data.move_calls().iter().map(|c| Cow::Borrowed(*c)).collect(),
-	// };
-	//
-	// let keep_tx_sig = mongo::insert_transaction_signature(cfg, &tx_sig_col, mongo_database);
-	// let keep_move_calls = mongo::insert_move_calls(cfg, &move_call_col, mongo_database);
-	//
-	// if let Err(err) = keep_tx_sig.await {
-	// 	error!("Failed inserting transaction signature for checkpoint {checkpoint_number}: {err:?}");
-	// 	res.0 = Err(());
-	// }
-	// if let Err(err) = keep_move_calls.await {
-	// 	error!("Failed inserting move calls for checkpoint {checkpoint_number}: {err:?}");
-	// 	res.1 = Err(());
-	// }
-	// } else {
-	// warn!("Non-existent optional transaction_block for checkpoint {checkpoint_number}");
-	// }
 }
