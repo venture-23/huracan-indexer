@@ -69,6 +69,9 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockDataCol {
 	pub checkpoint: CheckpointSequenceNumber,
+	// This is vec only to support deserialization
+	// While inserting ( serialization ), always expect to .len()==1
+	// see: insert_transaction_block_data for more
 	pub blocks:     Vec<SuiTransactionBlockResponse>,
 }
 
@@ -77,37 +80,36 @@ pub async fn insert_transaction_block_data(
 	block: &BlockDataCol,
 	db: &Database,
 ) -> Result<(), mongodb::error::Error> {
+	// We only insert one digest at once
+	// mongodb query below depends on this assumption
+	assert!(block.blocks.len() == 1, "Cam only insert one digest at once");
 	let collection = db.collection::<BlockDataCol>(&mongo_collection_name(cfg, "_blocks"));
 
-	let blocks_bson = bson::Bson::Array(
-		block
-			.blocks
-			.iter()
-			.map(bson::to_bson)
-			.collect::<bson::ser::Result<Vec<_>>>()
-			.map_err(mongodb::error::ErrorKind::BsonSerialization)?,
-	);
+	let bson_block = match block.blocks.first() {
+		None => bson::Bson::Document(doc! {}),
+		Some(bl) => bson::to_bson(&bl).map_err(mongodb::error::ErrorKind::BsonSerialization)?,
+	};
 
 	// TODO: CRITICAL:
 	// Inserting with conversion to i64 is not ideal. WIll occur overflow
-	let filter = doc! { "checkpoint": block.checkpoint as i64 };
-	let update = doc! { "$push": { "blocks": { "$each": blocks_bson  } } };
-
-	let push_res = collection.update_one(filter, update, None).await;
-
-	if let Ok(push_res) = push_res {
-		// check if the filter matched any record. if not this means, this is the first
-		// record for given checkpoint. So just insert it
-		if push_res.matched_count == 0 {
-			info!("Found first digest for checkpoint: {}", block.checkpoint);
-			collection.insert_one(block, None).await?;
-			Ok(())
-		} else {
-			// some record have been updated
-			Ok(())
-		}
+	let find_cp = doc! { "checkpoint": block.checkpoint as i64 };
+	let is_new_cp = collection.count_documents(find_cp, None).await? == 0;
+	if is_new_cp {
+		// This is new cp, just insert the whole block with checkpointSequenceNumber
+		info!("Found first digest for checkpoint: {}", block.checkpoint);
+		collection.insert_one(block, None).await?;
+		Ok(())
 	} else {
-		push_res?;
-		unreachable!()
+		// This checkpoint have already some other digest
+		// we have to only insert if this digest is unique
+		// so put this check in filter as well
+		let filter = doc! {
+			"checkpoint": { "$eq": block.checkpoint as i64 },
+			"blocks": { "$ne": &bson_block }
+		};
+
+		let update = doc! { "$push": { "blocks": &bson_block } };
+		collection.update_one(filter, update, None).await?;
+		Ok(())
 	}
 }
