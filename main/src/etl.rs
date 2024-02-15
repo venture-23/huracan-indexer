@@ -16,7 +16,7 @@ use chrono::Utc;
 use futures::Stream;
 use futures_batch::ChunksTimeoutStreamExt;
 use influxdb::InfluxDbWriteable;
-use mongodb::{options::FindOneOptions, Database};
+use mongodb::{error as mongoerror, options::FindOneOptions, Database};
 use pulsar::{Pulsar, TokioExecutor};
 use rocksdb::{DBWithThreadMode, SingleThreaded};
 use sui_sdk::rpc_types::{
@@ -814,7 +814,7 @@ async fn do_scan(
 		// start fetching all tx blocks for this checkpoint
 		let q = SuiTransactionBlockResponseQuery::new(
 			Some(TransactionFilter::Checkpoint(cp as CheckpointSequenceNumber)),
-			Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input()),
+			Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input().with_events()),
 		);
 		let mut cursor = None;
 		let mut retries_left = pc.checkpointretries;
@@ -921,7 +921,7 @@ async fn do_poll(
 	info!("ExtractionInfo: Initializing do_poll()");
 	let q = SuiTransactionBlockResponseQuery::new(
 		None,
-		Some(SuiTransactionBlockResponseOptions::new().with_object_changes()),
+		Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input().with_events()),
 	);
 
 	let stop = ctrl_c_bool();
@@ -930,6 +930,7 @@ async fn do_poll(
 	let mut desc = true;
 	let mut checkpoints = HashSet::with_capacity(64);
 	let mut last_poll = Instant::now().checked_sub(Duration::from_millis(cfg.pollintervalms)).unwrap();
+	let mongo_database = cfg.mongo.client(&cfg.livescan.mongo).await.unwrap();
 
 	loop {
 		if stop.load(Relaxed) {
@@ -978,7 +979,14 @@ async fn do_poll(
 
 				checkpoints.clear();
 				for block in page.data {
-					println!("[+] Fround checkoint {:?} from do_pool", block.checkpoint);
+					// venture-23 addition
+					let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
+					if venture_res.is_err() {
+						error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {:?} unfinished", block.checkpoint);
+						return;
+					}
+
+					// ===============
 					// if we found a new (to this iteration) checkpoint, we want to let the checkpoints-based
 					// processor know immediately
 					// we also skip those items here, so we don't need to coordinate with it
@@ -1228,9 +1236,5 @@ pub async fn record_venture_data(
 	mongo_database: &mongodb::Database,
 	cfg: &AppConfig,
 ) -> Result<(), ()> {
-	let checkpoint_number = block.checkpoint.expect("Checpoint is always present in read_api response");
-
-	let block_col = mongo::BlockDataCol { checkpoint: checkpoint_number, blocks: vec![block.clone()] };
-	let keep_block_res = mongo::insert_transaction_block_data(cfg, &block_col, mongo_database).await;
-	keep_block_res.map(|_| ()).map_err(|_| ())
+	mongo::insert_transaction_block_data(cfg, &mongo::DigestCol::new(block), mongo_database).await.map_err(|_| ())
 }

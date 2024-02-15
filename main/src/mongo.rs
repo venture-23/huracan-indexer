@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use bson::doc;
 use influxdb::InfluxDbWriteable;
-use mongodb::{options::UpdateOptions, Database};
+use mongodb::{error as mongoerror, options::UpdateOptions, Database};
 use sui_sdk::rpc_types::{
 	SuiProgrammableMoveCall, SuiTransactionBlock, SuiTransactionBlockData, SuiTransactionBlockDataV1,
 	SuiTransactionBlockResponse,
@@ -66,50 +66,84 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 	}
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockDataCol {
-	pub checkpoint: CheckpointSequenceNumber,
-	// This is vec only to support deserialization
-	// While inserting ( serialization ), always expect to .len()==1
-	// see: insert_transaction_block_data for more
-	pub blocks:     Vec<SuiTransactionBlockResponse>,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DigestCol<'parent> {
+	// Sui-Sdk struct: https://mystenlabs.github.io/sui/sui_json_rpc_types/struct.SuiTransactionBlockResponse.html
+	// [Accessed as of 12th Feb 2023]:
+	// pub struct SuiTransactionBlockResponse {
+	//      pub digest: TransactionDigest,
+	//      pub transaction: Option<SuiTransactionBlock>,
+	//      pub raw_transaction: Vec<u8>,
+	//      pub effects: Option<SuiTransactionBlockEffects>,
+	//      pub events: Option<SuiTransactionBlockEvents>,
+	//      pub object_changes: Option<Vec<ObjectChange>>,
+	//      pub balance_changes: Option<Vec<BalanceChange>>,
+	//      pub timestamp_ms: Option<u64>,
+	//      pub confirmed_local_execution: Option<bool>,
+	//      pub checkpoint: Option<CheckpointSequenceNumber>,
+	//      pub errors: Vec<String>,
+	//      pub raw_effects: Vec<u8>,
+	//  }
+	pub transaction:               Cow<'parent, Option<sui_sdk::rpc_types::SuiTransactionBlock>>,
+	pub raw_transaction:           Cow<'parent, Vec<u8>>,
+	pub effects:                   Cow<'parent, Option<sui_sdk::rpc_types::SuiTransactionBlockEffects>>,
+	pub events:                    Cow<'parent, Option<sui_sdk::rpc_types::SuiTransactionBlockEvents>>,
+	pub balance_changes:           Cow<'parent, Option<Vec<sui_sdk::rpc_types::BalanceChange>>>,
+	pub timestamp_ms:              Cow<'parent, Option<u64>>,
+	pub confirmed_local_execution: Cow<'parent, Option<bool>>,
+	pub checkpoint:                Cow<'parent, Option<u64>>,
+	pub errors:                    Cow<'parent, Vec<String>>,
+	pub digest:                    Cow<'parent, TransactionDigest>,
+	pub object_changes:            Cow<'parent, Option<Vec<sui_sdk::rpc_types::ObjectChange>>>,
+}
+
+impl<'parent> DigestCol<'parent> {
+	pub fn new(block_response: &'parent SuiTransactionBlockResponse) -> Self {
+		let SuiTransactionBlockResponse {
+			transaction,
+			raw_transaction,
+			effects,
+			events,
+			balance_changes,
+			timestamp_ms,
+			confirmed_local_execution,
+			checkpoint,
+			errors,
+			digest,
+			object_changes,
+		} = block_response;
+		Self {
+			transaction:               Cow::Borrowed(transaction),
+			raw_transaction:           Cow::Borrowed(raw_transaction),
+			effects:                   Cow::Borrowed(effects),
+			events:                    Cow::Borrowed(events),
+			balance_changes:           Cow::Borrowed(balance_changes),
+			timestamp_ms:              Cow::Borrowed(timestamp_ms),
+			confirmed_local_execution: Cow::Borrowed(confirmed_local_execution),
+			checkpoint:                Cow::Borrowed(checkpoint),
+			errors:                    Cow::Borrowed(errors),
+			digest:                    Cow::Borrowed(digest),
+			object_changes:            Cow::Borrowed(object_changes),
+		}
+	}
 }
 
 pub async fn insert_transaction_block_data(
 	cfg: &AppConfig,
-	block: &BlockDataCol,
+	block: &DigestCol<'_>,
 	db: &Database,
 ) -> Result<(), mongodb::error::Error> {
-	// We only insert one digest at once
-	// mongodb query below depends on this assumption
-	assert!(block.blocks.len() == 1, "Cam only insert one digest at once");
-	let collection = db.collection::<BlockDataCol>(&mongo_collection_name(cfg, "_blocks"));
+	let collection = db.collection::<bson::Document>(&mongo_collection_name(cfg, "_digests"));
+	let encoded_digest = block.digest.base58_encode();
 
-	let bson_block = match block.blocks.first() {
-		None => bson::Bson::Document(doc! {}),
-		Some(bl) => bson::to_bson(&bl).map_err(mongodb::error::ErrorKind::BsonSerialization)?,
-	};
-
-	// TODO: CRITICAL:
-	// Inserting with conversion to i64 is not ideal. WIll occur overflow
-	let find_cp = doc! { "checkpoint": block.checkpoint as i64 };
-	let is_new_cp = collection.count_documents(find_cp, None).await? == 0;
-	if is_new_cp {
-		// This is new cp, just insert the whole block with checkpointSequenceNumber
-		info!("Found first digest for checkpoint: {}", block.checkpoint);
-		collection.insert_one(block, None).await?;
-		Ok(())
-	} else {
-		// This checkpoint have already some other digest
-		// we have to only insert if this digest is unique
-		// so put this check in filter as well
-		let filter = doc! {
-			"checkpoint": { "$eq": block.checkpoint as i64 },
-			"blocks": { "$ne": &bson_block }
+	let is_new_digest = collection.count_documents(doc! {"_id": &encoded_digest}, None).await? == 0;
+	if is_new_digest {
+		let document = doc! {
+			"_id": encoded_digest,
+			"digest": bson::to_bson(block).map_err(mongoerror::ErrorKind::BsonSerialization)?,
 		};
-
-		let update = doc! { "$push": { "blocks": &bson_block } };
-		collection.update_one(filter, update, None).await?;
+		collection.insert_one(document, None).await.map(|_| ())
+	} else {
 		Ok(())
 	}
 }
