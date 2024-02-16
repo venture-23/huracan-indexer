@@ -16,6 +16,8 @@ use crate::{
 	influx::{write_metric_checkpoint_error, write_metric_create_checkpoint, write_metric_mongo_write_error},
 };
 
+const fn always_true<A>(_: &A) -> bool { true }
+
 #[derive(Serialize, Deserialize)]
 pub struct Checkpoint {
 	// TODO mongo u64 issue
@@ -94,6 +96,11 @@ pub struct DigestCol<'parent> {
 	pub checkpoint:                Cow<'parent, Option<u64>>,
 	pub errors:                    Cow<'parent, Vec<String>>,
 	pub digest:                    Cow<'parent, TransactionDigest>,
+    // since object changes is already tracked seperately,
+    // we dont need this:
+    // TODO: remove the whole field instead
+    #[serde(skip_serializing_if = "always_true")]
+    #[serde(skip_deserializing)]
 	pub object_changes:            Cow<'parent, Option<Vec<sui_sdk::rpc_types::ObjectChange>>>,
 }
 
