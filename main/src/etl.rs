@@ -827,19 +827,19 @@ async fn do_scan(
 				Ok(page) => {
 					retries_left = pc.checkpointretries;
 					for block in page.data {
-						// venture-23 addition
+						// ================= venture-23 addition =============================
 						let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
 						if venture_res.is_err() {
 							if retries_left == 0 {
 								error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {cp} unfinished");
-								break;
+								break
 							}
 							warn!("ExtractionInfo: Could not write venture data. Retries left: Retrying");
 							retries_left -= 1;
 							tokio::time::sleep(Duration::from_millis(pc.checkpointretrytimeoutms)).await;
-							continue;
+							continue
 						}
-						// ===============
+						// =======================================================================
 						if let Some(changes) = block.object_changes {
 							let mut tx_digest_once = Some(block.digest);
 							for change in changes {
@@ -979,14 +979,13 @@ async fn do_poll(
 
 				checkpoints.clear();
 				for block in page.data {
-					// venture-23 addition
+					// ========================= venture-23 addition ====================
 					let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
 					if venture_res.is_err() {
 						error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {:?} unfinished", block.checkpoint);
-						return;
+						return
 					}
-
-					// ===============
+					// ==================================================================
 					// if we found a new (to this iteration) checkpoint, we want to let the checkpoints-based
 					// processor know immediately
 					// we also skip those items here, so we don't need to coordinate with it
@@ -1148,6 +1147,16 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
                     // (if the object has already been deleted, we still allow setting any other fields, including
                     // any previously valid full object state... probably not needed, but also not incorrect)
                     let mut c = Cursor::new(&item.bytes);
+                    // ================= venture-23 addition ========================
+			        let then_doc = Document::from_reader(&mut c).unwrap();
+			        let object_type = then_doc
+				        .get_document("bcs")
+				        .map(|d| d.get_str("type").expect("Expecting type in bcs document"))
+				        .expect("Expecting bcs document in object");
+                    println!("\n====================\nObject type: {object_type}.\nCollection Name: {}\n", mongo::object_col_name(&cfg, &object_type));
+
+			        // ==============================================================
+
                     doc! {
 						"q": doc! { "_id": item.id.to_string() },
 						// use an aggregation pipeline in our update, so that we can conditionally update
@@ -1160,7 +1169,7 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 								// afterwards, the other fields can rely on it being present
 								"version_": {"$cond": { "if": { "$or": [ { "$lt": [ "$version_", v_ ] }, { "$lte": [ "$version", None::<i32> ] } ] }, "then": v_, "else": "$version_" }},
 								"version": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": v.clone(), "else": "$version" }},
-								"object": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": Document::from_reader(&mut c).unwrap(), "else": "$object" }},
+								"object": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": then_doc, "else": "$object" }},
 							},
 						}],
 						"upsert": true,
@@ -1214,7 +1223,7 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 						Ok(string) => debug!(string),
 						Err(error) => warn!("Could not write to influx: {}", error),
 					}
-					break;
+					break
 				}
 				Err(err) => {
 					// the whole thing failed; retry a few times, then assume it's a bug

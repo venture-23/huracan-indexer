@@ -30,7 +30,7 @@ pub(crate) fn check_obj_type_from_string_vec(input_obj_type: &ObjectType, obj_ty
 	for item in obj_type_string_vec {
 		let item_obj_type = ObjectType::from_str(&item).unwrap();
 		if input_obj_type == &item_obj_type {
-			return true;
+			return true
 		}
 	}
 	false

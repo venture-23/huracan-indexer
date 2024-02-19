@@ -272,5 +272,5 @@ pub async fn write_metric_extraction_latency(source: String, latency_ms: i32) {
 pub(crate) async fn get_influx_timestamp_as_milliseconds() -> Timestamp {
 	let start = SystemTime::now();
 	let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards").as_millis();
-	return Timestamp::Milliseconds(since_the_epoch);
+	return Timestamp::Milliseconds(since_the_epoch)
 }

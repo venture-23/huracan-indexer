@@ -16,7 +16,9 @@ use crate::{
 	influx::{write_metric_checkpoint_error, write_metric_create_checkpoint, write_metric_mongo_write_error},
 };
 
-const fn always_true<A>(_: &A) -> bool { true }
+const fn always_true<A>(_: &A) -> bool {
+	true
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -68,6 +70,49 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 	}
 }
 
+const SUI_TYPES: &[&str] =
+	&["0x2::kiosk::Kiosk", "0x2::kiosk::Item", "0x2::kiosk::Lock", "0x2::kiosk::Listing", "0x2::transfer_policy"];
+const SUI_TYPES_COL_NAME: &[&str] = &["_kiosks", "_kiosks_item", "_kiosks_lock", "_kiosks_listing", "_transfer_policy"];
+
+const OBJECT_TYPES_NAME: &[(&str, &str)] = &[
+	("0x2::kiosk::Kiosk", "_kiosk"),
+	("0x2::kiosk::Item", "_kiosk_item"),
+	("0x2::kiosk::Lock", "_kiosk_lock"),
+	("0x2::kiosk::Listing", "_kiosk_listing"),
+	("0x2::transfer_policy", "transfer_policy"),
+];
+
+pub fn parse_object_type(object_type: &str) -> (String, String, String, Vec<String>) {
+	let mut generics = Vec::new();
+	let ty = if let Some((ty, terms)) = object_type.split_once('<') {
+		let terms = &terms[..terms.len() - 1];
+		for term in terms.split(",") {
+			generics.push(term.trim_start().to_string());
+		}
+		ty
+	} else {
+		object_type
+	};
+
+	let mut it = ty.split("::");
+	let package = it.next().unwrap().to_string();
+	let module = it.next().unwrap().to_string();
+	let class = it.next().unwrap().to_string();
+
+	(package, module, class, generics)
+}
+
+pub fn object_col_name(cfg: &AppConfig, object_type: &str) -> String {
+	let (package, module, class, generics) = parse_object_type(object_type);
+
+	let generics = generics.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
+	match (package.as_str(), module.as_str(), class.as_str(), generics.as_slice()) {
+		("0x2", "coin", "Coin", ["0x2::sui::SUI"]) => mongo_collection_name(cfg, "_sui_coin"),
+		("0x2", "kiosk", "Kiosk", []) => mongo_collection_name(cfg, "_kiosks"),
+		_ => mongo_collection_name(cfg, "_untyped"),
+	}
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DigestCol<'parent> {
 	// Sui-Sdk struct: https://mystenlabs.github.io/sui/sui_json_rpc_types/struct.SuiTransactionBlockResponse.html
@@ -96,11 +141,11 @@ pub struct DigestCol<'parent> {
 	pub checkpoint:                Cow<'parent, Option<u64>>,
 	pub errors:                    Cow<'parent, Vec<String>>,
 	pub digest:                    Cow<'parent, TransactionDigest>,
-    // since object changes is already tracked seperately,
-    // we dont need this:
-    // TODO: remove the whole field instead
-    #[serde(skip_serializing_if = "always_true")]
-    #[serde(skip_deserializing)]
+	// since object changes is already tracked seperately,
+	// we dont need this:
+	// TODO: remove the whole field instead
+	#[serde(skip_serializing_if = "always_true")]
+	#[serde(skip_deserializing)]
 	pub object_changes:            Cow<'parent, Option<Vec<sui_sdk::rpc_types::ObjectChange>>>,
 }
 
