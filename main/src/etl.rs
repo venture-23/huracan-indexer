@@ -1245,5 +1245,17 @@ pub async fn record_venture_data(
 	mongo_database: &mongodb::Database,
 	cfg: &AppConfig,
 ) -> Result<(), ()> {
-	mongo::insert_transaction_block_data(cfg, &mongo::DigestCol::new(block), mongo_database).await.map_err(|_| ())
+	let digest_col = mongo::DigestCol::new(block);
+	let obj_col = mongo::ObjectChangeDigest::produce_from_digest(&digest_col);
+
+	let tx_res = mongo::insert_transaction_block_data(cfg, &digest_col, mongo_database).await;
+	let obj_res = mongo::insert_object_changes_data(cfg, &obj_col, mongo_database).await;
+
+	println!("\n==========\ntx_res: {tx_res:?}\n");
+	println!("\n==========\nobj_res: {obj_res:?}\n");
+
+	tx_res.map_err(|_| ())?;
+	obj_res.map_err(|_| ())?;
+
+	Ok(())
 }

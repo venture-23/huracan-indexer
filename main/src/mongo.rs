@@ -70,18 +70,6 @@ pub async fn mongo_checkpoint(cfg: &AppConfig, pc: &PipelineConfig, db: &Databas
 	}
 }
 
-const SUI_TYPES: &[&str] =
-	&["0x2::kiosk::Kiosk", "0x2::kiosk::Item", "0x2::kiosk::Lock", "0x2::kiosk::Listing", "0x2::transfer_policy"];
-const SUI_TYPES_COL_NAME: &[&str] = &["_kiosks", "_kiosks_item", "_kiosks_lock", "_kiosks_listing", "_transfer_policy"];
-
-const OBJECT_TYPES_NAME: &[(&str, &str)] = &[
-	("0x2::kiosk::Kiosk", "_kiosk"),
-	("0x2::kiosk::Item", "_kiosk_item"),
-	("0x2::kiosk::Lock", "_kiosk_lock"),
-	("0x2::kiosk::Listing", "_kiosk_listing"),
-	("0x2::transfer_policy", "transfer_policy"),
-];
-
 pub fn parse_object_type(object_type: &str) -> (String, String, String, Vec<String>) {
 	let mut generics = Vec::new();
 	let ty = if let Some((ty, terms)) = object_type.split_once('<') {
@@ -114,6 +102,35 @@ pub fn object_col_name(cfg: &AppConfig, object_type: &str) -> String {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ObjectChangeDigest<'parent> {
+	#[serde(rename = "_id")]
+	pub id:            String,
+	pub tx_digest:     Cow<'parent, String>,
+	pub obj_id:        Cow<'parent, String>,
+	pub object_change: Cow<'parent, sui_sdk::rpc_types::ObjectChange>,
+}
+
+impl<'parent> ObjectChangeDigest<'parent> {
+	pub fn produce_from_digest(digest_col: &'parent DigestCol<'parent>) -> Vec<Self> {
+		let mut res = Vec::new();
+
+		if let Some(object_changes) = digest_col.object_changes.as_ref() {
+			for obj_change in object_changes.iter() {
+				let obj = Self {
+					tx_digest:     Cow::Borrowed(&digest_col.digest),
+					obj_id:        Cow::Owned(obj_change.object_id().to_string()),
+					object_change: Cow::Borrowed(obj_change),
+					id:            format!("{}-{}", digest_col.digest, obj_change.object_id().to_string()),
+				};
+				res.push(obj);
+			}
+		}
+
+		res
+	}
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DigestCol<'parent> {
 	// Sui-Sdk struct: https://mystenlabs.github.io/sui/sui_json_rpc_types/struct.SuiTransactionBlockResponse.html
 	// [Accessed as of 12th Feb 2023]:
@@ -140,12 +157,7 @@ pub struct DigestCol<'parent> {
 	pub confirmed_local_execution: Cow<'parent, Option<bool>>,
 	pub checkpoint:                Cow<'parent, Option<u64>>,
 	pub errors:                    Cow<'parent, Vec<String>>,
-	pub digest:                    Cow<'parent, TransactionDigest>,
-	// since object changes is already tracked seperately,
-	// we dont need this:
-	// TODO: remove the whole field instead
-	#[serde(skip_serializing_if = "always_true")]
-	#[serde(skip_deserializing)]
+	pub digest:                    Cow<'parent, String>,
 	pub object_changes:            Cow<'parent, Option<Vec<sui_sdk::rpc_types::ObjectChange>>>,
 }
 
@@ -174,10 +186,21 @@ impl<'parent> DigestCol<'parent> {
 			confirmed_local_execution: Cow::Borrowed(confirmed_local_execution),
 			checkpoint:                Cow::Borrowed(checkpoint),
 			errors:                    Cow::Borrowed(errors),
-			digest:                    Cow::Borrowed(digest),
+			digest:                    Cow::Owned(digest.to_string()),
 			object_changes:            Cow::Borrowed(object_changes),
 		}
 	}
+}
+
+pub async fn insert_object_changes_data(
+	cfg: &AppConfig,
+	changed_objects: &[ObjectChangeDigest<'_>],
+	db: &Database,
+) -> Result<(), mongodb::error::Error> {
+	let collection = db.collection::<ObjectChangeDigest>(&mongo_collection_name(cfg, "_changed_objs"));
+	let insert_res = collection.insert_many(changed_objects.iter(), None).await?;
+	assert!(insert_res.inserted_ids.len() == changed_objects.len());
+	Ok(())
 }
 
 pub async fn insert_transaction_block_data(
@@ -186,16 +209,14 @@ pub async fn insert_transaction_block_data(
 	db: &Database,
 ) -> Result<(), mongodb::error::Error> {
 	let collection = db.collection::<bson::Document>(&mongo_collection_name(cfg, "_digests"));
-	let encoded_digest = block.digest.base58_encode();
 
-	let is_new_digest = collection.count_documents(doc! {"_id": &encoded_digest}, None).await? == 0;
+	let is_new_digest = collection.count_documents(doc! {"_id": block.digest.as_ref()}, None).await? == 0;
 	if is_new_digest {
 		let document = doc! {
-			"_id": encoded_digest,
+			"_id": block.digest.as_ref(),
 			"digest": bson::to_bson(block).map_err(mongoerror::ErrorKind::BsonSerialization)?,
 		};
-		collection.insert_one(document, None).await.map(|_| ())
-	} else {
-		Ok(())
+		collection.insert_one(document, None).await?;
 	}
+	Ok(())
 }
