@@ -106,6 +106,7 @@ pub struct ObjectChangeDigest<'parent> {
 	#[serde(rename = "_id")]
 	pub id:            String,
 	pub tx_digest:     Cow<'parent, String>,
+	pub timestamp_ms:  Option<u64>,
 	pub obj_id:        Cow<'parent, String>,
 	pub object_change: Cow<'parent, sui_sdk::rpc_types::ObjectChange>,
 }
@@ -120,6 +121,7 @@ impl<'parent> ObjectChangeDigest<'parent> {
 					tx_digest:     Cow::Borrowed(&digest_col.digest),
 					obj_id:        Cow::Owned(obj_change.object_id().to_string()),
 					object_change: Cow::Borrowed(obj_change),
+					timestamp_ms:  *digest_col.timestamp_ms.clone(),
 					id:            format!("{}-{}", digest_col.digest, obj_change.object_id().to_string()),
 				};
 				res.push(obj);
