@@ -1,11 +1,13 @@
 use std::{
+	borrow::Cow,
 	collections::{btree_map::OccupiedError, BTreeMap},
 	fmt::{Display, Formatter},
 	io::Cursor,
-	sync::atomic::{AtomicU16, Ordering::Relaxed},
-	vec::IntoIter,
 	iter::zip,
+	option::IntoIter,
+	sync::atomic::{AtomicU16, Ordering::Relaxed},
 };
+
 use anyhow::Result;
 use async_channel::{Receiver as ACReceiver, Sender as ACSender};
 use async_stream::stream;
@@ -14,11 +16,12 @@ use chrono::Utc;
 use futures::Stream;
 use futures_batch::ChunksTimeoutStreamExt;
 use influxdb::InfluxDbWriteable;
-use mongodb::{Database, options::FindOneOptions};
+use mongodb::{error as mongoerror, options::FindOneOptions, Database};
 use pulsar::{Pulsar, TokioExecutor};
 use rocksdb::{DBWithThreadMode, SingleThreaded};
 use sui_sdk::rpc_types::{
-	SuiObjectDataOptions, SuiTransactionBlockResponseOptions, SuiTransactionBlockResponseQuery, TransactionFilter,
+	SuiObjectDataOptions, SuiTransactionBlockData, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
+	SuiTransactionBlockResponseQuery, TransactionFilter,
 };
 use sui_types::{
 	base_types::{ObjectID, SequenceNumber, TransactionDigest},
@@ -33,15 +36,20 @@ use tokio::{
 use crate::{
 	_prelude::*,
 	client,
-	client::{ClientPool, parse_get_object_response},
-	conf::{AppConfig, PipelineConfig},
-	ctrl_c_bool, mongo,
-	mongo::{Checkpoint, mongo_checkpoint},
-	utils::make_descending_ranges
+	client::{parse_get_object_response, ClientPool},
+	conf::{get_influx_singleton, AppConfig, PipelineConfig},
+	ctrl_c_bool,
+	influx::{
+		get_influx_timestamp_as_milliseconds, write_metric_backfill_init, write_metric_checkpoints_behind,
+		write_metric_create_checkpoint, write_metric_current_checkpoint, write_metric_extraction_latency,
+		write_metric_final_checkpoint, write_metric_mongo_write_error, write_metric_pause_livescan,
+		write_metric_rpc_error, write_metric_rpc_request, write_metric_start_livescan, InsertObject, ModifiedObject,
+		UnchangedObject,
+	},
+	mongo,
+	mongo::{mongo_checkpoint, Checkpoint},
+	utils::make_descending_ranges,
 };
-use crate::conf::get_influx_singleton;
-use crate::influx::{get_influx_timestamp_as_milliseconds, InsertObject, ModifiedObject, write_metric_rpc_error, write_metric_rpc_request, write_metric_mongo_write_error, write_metric_checkpoints_behind, write_metric_backfill_init, write_metric_current_checkpoint, write_metric_create_checkpoint, write_metric_final_checkpoint, write_metric_pause_livescan, write_metric_start_livescan, UnchangedObject, write_metric_extraction_latency};
-
 
 // sui now allows a max of 1000 objects to be queried for at once (used to be 50), at least on the
 // endpoints we're using (try_multi_get_parsed_past_object, query_transaction_blocks)
@@ -106,11 +114,13 @@ pub async fn run(cfg: &AppConfig) -> Result<()> {
 	let pause_livescan = Arc::new(AtomicU16::new(0));
 
 	// Initialize livescan.
-	let (mut poll_livescan_items, _poll_observed_cps) = spawn_checkpoint_poll(cfg, sui.clone(), pause_livescan.clone()).await;
+	let (mut poll_livescan_items, _poll_observed_cps) =
+		spawn_checkpoint_poll(cfg, sui.clone(), pause_livescan.clone()).await;
 
 	// TODO: These unbounded channels could be the source of the memory leak.
 	let (livescan_items_tx, livescan_items_rx) = async_channel::unbounded();
-	let (poll_livescan_items_transactions_tx, mut poll_livescan_items_transactions) = tokio::sync::mpsc::unbounded_channel();
+	let (poll_livescan_items_transactions_tx, mut poll_livescan_items_transactions) =
+		tokio::sync::mpsc::unbounded_channel();
 
 	// Purpose of poll_livescan_items stream:
 	// 1) Pass on as normal input to livescan pipeline immediately.
@@ -135,8 +145,7 @@ pub async fn run(cfg: &AppConfig) -> Result<()> {
 
 	// rest of the livescan pipeline
 	let (livescan_cp_control_tx, livescan_handle) =
-		spawn_pipeline_tail(cfg.clone(), cfg.livescan.clone(), sui.clone(),  livescan_items_rx.clone())
-			.await?;
+		spawn_pipeline_tail(cfg.clone(), cfg.livescan.clone(), sui.clone(), livescan_items_rx.clone()).await?;
 
 	// observe checkpoints flow:
 	// if we fell behind too far, we focus on backfilling until caught up:
@@ -224,9 +233,7 @@ pub async fn run(cfg: &AppConfig) -> Result<()> {
 					}
 					// run backfill
 					let (checkpointcompleted_rx, handle) =
-						spawn_backfill_pipeline(&cfg, &cfg.backfill, sui.clone(), None)
-							.await
-							.unwrap();
+						spawn_backfill_pipeline(&cfg, &cfg.backfill, sui.clone(), None).await.unwrap();
 					// We continue low-latency work as soon as the first checkpoint crawl of the backfill completes,
 					// so we incur as little unnecessary latency as possible while just waiting for
 					// some remaining items to be completed
@@ -353,7 +360,11 @@ pub async fn run(cfg: &AppConfig) -> Result<()> {
 					if cur_cp != cp {
 						info!("ExtractionInfo: Current unprocessed items in checkpoint: {}", cur_cp);
 						if cur_cp != 0 {
-							if livescan_cp_control_tx.send((cur_cp as CheckpointSequenceNumber, num_items)).await.is_err() {
+							if livescan_cp_control_tx
+								.send((cur_cp as CheckpointSequenceNumber, num_items))
+								.await
+								.is_err()
+							{
 								break
 							}
 						}
@@ -419,7 +430,7 @@ async fn spawn_livescan(
 	let default_num_workers = sui.configs.len();
 	let num_checkpoint_workers = cfg.livescan.workers.checkpoint.unwrap_or(default_num_workers);
 
-	// turn our last cp into a fake completed range, which will make the scan stop
+	// turn our last cp int; a fake completed range, which will make the scan stop
 	let completed_checkpoint_ranges = vec![(stop_at_cp, 0)];
 
 	let (items_tx, items_rx) = async_channel::bounded(cfg.livescan.queuebuffers.checkpointout);
@@ -428,6 +439,7 @@ async fn spawn_livescan(
 	for partition in 0..num_checkpoint_workers {
 		write_metric_start_livescan().await;
 		tokio::spawn(do_scan(
+			cfg.clone(),
 			cfg.livescan.clone(),
 			IngestRoute::Livescan,
 			checkpoint_max,
@@ -489,7 +501,10 @@ async fn spawn_pipeline_tail(
 					// convert stream to channel
 					pin!(stream);
 					while let Some(it) = stream.next().await {
-						mongo_tx.send(it).await.expect("ExtractionInfo: passing items from object data stream to mongo tokio channel");
+						mongo_tx
+							.send(it)
+							.await
+							.expect("ExtractionInfo: passing items from object data stream to mongo tokio channel");
 					}
 				}
 			});
@@ -635,11 +650,13 @@ async fn spawn_backfill_pipeline(
 	};
 
 	// MPMC channel, as an easy way to balance incoming work from checkpoint workers into multiple object workers.
-	info!("ExtractionInfo: Initializing Tokio channel for object workers with bound limit {}", pc.queuebuffers.checkpointout);
+	info!(
+		"ExtractionInfo: Initializing Tokio channel for object workers with bound limit {}",
+		pc.queuebuffers.checkpointout
+	);
 	let (object_ids_tx, object_ids_rx) = async_channel::bounded(pc.queuebuffers.checkpointout);
 
-	let (cp_control_tx, handle) =
-		spawn_pipeline_tail(cfg.clone(), pc.clone(), sui.clone(), object_ids_rx).await?;
+	let (cp_control_tx, handle) = spawn_pipeline_tail(cfg.clone(), pc.clone(), sui.clone(), object_ids_rx).await?;
 
 	info!("Initializing {} number of backfill workers.", num_checkpoint_workers);
 	let (checkpointfinished_tx, checkpointfinished_rx) = tokio::sync::oneshot::channel();
@@ -648,6 +665,7 @@ async fn spawn_backfill_pipeline(
 		let mut handles = Vec::with_capacity(num_checkpoint_workers);
 		for partition in 0..num_checkpoint_workers {
 			handles.push(tokio::spawn(do_scan(
+				cfg.clone(),
 				pc.clone(),
 				IngestRoute::Backfill,
 				checkpoint_max,
@@ -672,154 +690,6 @@ async fn spawn_backfill_pipeline(
 }
 
 // TODO: This function is WIP
-async fn do_walk(
-	pc: PipelineConfig,
-	ingest_route: IngestRoute,
-	checkpoint_start: u64,
-	completed_checkpoint_ranges: Vec<(u64, u64)>,
-	mut sui: ClientPool,
-	db: Option<Arc<DBWithThreadMode<SingleThreaded>>>,
-	object_ids_tx: ACSender<(Option<TransactionDigest>, ObjectItem)>,
-	cp_control_tx: TSender<(CheckpointSequenceNumber, u32)>,
-) {
-	// general idea:
-	// query first incomplete checkpoint
-	// skip items while within completed range
-	// remember last page digest
-	// if checkpoint of last item in current batch is still > N checkpoints away from next incomplete
-	// checkpoint, then we want to query by checkpoint again, otherwise continue from digest
-
-	let mut cp = checkpoint_start;
-	let mut last_cp = u64::MAX;
-
-	let mut completed_iter = completed_checkpoint_ranges.into_iter();
-	let mut completed_range = completed_iter.next();
-
-	'cp: loop {
-		let mut num_objects = 0u32;
-
-		macro_rules! traverse_checkpoints {
-			($next_cp:expr) => {
-				let next_cp = $next_cp;
-				match traverse_checkpoints(
-					&cp_control_tx,
-					&mut cp,
-					&mut completed_iter,
-					&mut completed_range,
-					&mut num_objects,
-					next_cp,
-				)
-				.await
-				{
-					MoveAction::Continue => {
-						// just continue as we would
-					}
-					MoveAction::NextCheckpoint => continue 'cp,
-					MoveAction::End => break 'cp,
-				}
-			};
-		}
-
-		// ensure we don't get into an infinite loop with the current checkpoint
-		if cp == last_cp {
-			traverse_checkpoints!(cp - 1);
-			last_cp = cp;
-		}
-
-		let mut query_cp = Some(cp);
-		let mut cursor = None;
-		let mut retries_left = pc.checkpointretries;
-
-		loop {
-			// loop that progresses through all pages of a query which has been started by checkpoint,
-			// but then does not limit itself to that single checkpoint
-			let call_start_ts = Utc::now().timestamp_millis() as u64;
-			let q = SuiTransactionBlockResponseQuery::new(
-				query_cp.take().map(|cp| TransactionFilter::Checkpoint(cp as CheckpointSequenceNumber)),
-				Some(SuiTransactionBlockResponseOptions::new().with_object_changes()),
-			);
-			let page = sui.query_transaction_blocks(q, cursor, Some(SUI_QUERY_MAX_RESULT_LIMIT), true).await;
-			match page {
-				Ok(page) => {
-					retries_left = pc.checkpointretries;
-					for block in page.data {
-						let block_cp = block.checkpoint.unwrap() as u64;
-						if block_cp != cp {
-							traverse_checkpoints!(block_cp);
-						}
-						// if we're still here, we want to track the next cursor immediately, as we
-						// might not actually have any changes in this block or will be skipping it
-						cursor = Some(block.digest);
-						// skip this block?
-						if block_cp > cp {
-							continue
-						}
-						if let Some(changes) = block.object_changes {
-							let mut tx_digest_once = Some(block.digest);
-							for change in changes {
-								let Some((object_id, version, deleted)) = client::parse_change(change) else {
-                                    continue;
-                                };
-								if let Some(db) = &db {
-									let k = object_id.as_slice();
-									// known?
-									if let None = db.get_pinned(k).unwrap() {
-										// no, new one, so we mark it as known
-										// FIXME put version so we can ensure only older versions are skipped
-										//	     in case we process things out of order
-										db.put(k, Vec::new()).unwrap();
-									// keep going below
-									} else {
-										continue
-									}
-								}
-								num_objects += 1;
-								// send to step 2
-								let send_res = object_ids_tx
-									.send((
-										tx_digest_once.take(),
-										ObjectItem {
-											cp: cp as CheckpointSequenceNumber,
-											deletion: deleted,
-											id: object_id,
-											version,
-											ts_sui: block.timestamp_ms,
-											ts_first_seen: call_start_ts,
-											ingested_via: ingest_route,
-											bytes: Default::default(),
-										},
-									))
-									.await;
-								if send_res.is_err() {
-									// channel closed, consumers stopped
-									break 'cp
-								}
-							}
-						}
-					}
-					if !page.has_next_page {
-						break
-					} else if page.next_cursor.is_none() {
-						warn!("ExtractionError: query_transaction_blocks({}, {:?}) page.has_next_page == true, but there is no page.next_cursor! continuing as if no next page. Posslbie Sui API bug.", cp, cursor);
-						break
-					} else {
-						cursor = page.next_cursor;
-					}
-				}
-				Err(err) => {
-					if retries_left == 0 {
-						warn!(error = ?err, "ExtractionError: Exhausted all retries fetching checkpoint data, leaving checkpoint {} unfinished for this run", cp);
-						break
-					}
-					warn!(error = ?err, "ExtractionError: There was an error reading object changes... retrying (retry #{}) after short timeout", retries_left);
-					retries_left -= 1;
-					tokio::time::sleep(Duration::from_millis(pc.checkpointretrytimeoutms)).await;
-				}
-			}
-		}
-	}
-}
-
 enum MoveAction {
 	Continue,
 	NextCheckpoint,
@@ -884,6 +754,7 @@ async fn traverse_checkpoints(
 
 // This is the technique used in Livescan and Backfill mode.
 async fn do_scan(
+	cfg: AppConfig,
 	pc: PipelineConfig,
 	ingest_route: IngestRoute,
 	checkpoint_max: u64,
@@ -896,6 +767,8 @@ async fn do_scan(
 	cp_control_tx: TSender<(CheckpointSequenceNumber, u32)>,
 ) {
 	info!("ExtractionInfo: Initializing do_scan()");
+
+	let mongo_database = cfg.mongo.client(&pc.mongo).await.unwrap();
 	let stop = ctrl_c_bool();
 	let mut completed_iter = completed_checkpoint_ranges.iter();
 	let mut completed_range = completed_iter.next();
@@ -941,7 +814,7 @@ async fn do_scan(
 		// start fetching all tx blocks for this checkpoint
 		let q = SuiTransactionBlockResponseQuery::new(
 			Some(TransactionFilter::Checkpoint(cp as CheckpointSequenceNumber)),
-			Some(SuiTransactionBlockResponseOptions::new().with_object_changes()),
+			Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input().with_events()),
 		);
 		let mut cursor = None;
 		let mut retries_left = pc.checkpointretries;
@@ -954,12 +827,25 @@ async fn do_scan(
 				Ok(page) => {
 					retries_left = pc.checkpointretries;
 					for block in page.data {
+						// ================= venture-23 addition =============================
+						let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
+						if venture_res.is_err() {
+							if retries_left == 0 {
+								error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {cp} unfinished");
+								break
+							}
+							warn!("ExtractionInfo: Could not write venture data. Retries left: Retrying");
+							retries_left -= 1;
+							tokio::time::sleep(Duration::from_millis(pc.checkpointretrytimeoutms)).await;
+							continue
+						}
+						// =======================================================================
 						if let Some(changes) = block.object_changes {
 							let mut tx_digest_once = Some(block.digest);
 							for change in changes {
 								let Some((object_id, version, deleted)) = client::parse_change(change) else {
-                                    continue;
-                                };
+									continue;
+								};
 								if let Some(db) = &db {
 									let k = object_id.as_slice();
 									// known?
@@ -1035,7 +921,7 @@ async fn do_poll(
 	info!("ExtractionInfo: Initializing do_poll()");
 	let q = SuiTransactionBlockResponseQuery::new(
 		None,
-		Some(SuiTransactionBlockResponseOptions::new().with_object_changes()),
+		Some(SuiTransactionBlockResponseOptions::new().with_object_changes().with_input().with_events()),
 	);
 
 	let stop = ctrl_c_bool();
@@ -1044,6 +930,7 @@ async fn do_poll(
 	let mut desc = true;
 	let mut checkpoints = HashSet::with_capacity(64);
 	let mut last_poll = Instant::now().checked_sub(Duration::from_millis(cfg.pollintervalms)).unwrap();
+	let mongo_database = cfg.mongo.client(&cfg.livescan.mongo).await.unwrap();
 
 	loop {
 		if stop.load(Relaxed) {
@@ -1075,7 +962,10 @@ async fn do_poll(
 				last_poll = call_start;
 				retry_count = 0;
 				if page.data.is_empty() {
-					info!("ExtractionInfo: No new txs when querying with desc={} cursor={:?}, retrying immediately", desc, cursor);
+					info!(
+						"ExtractionInfo: No new txs when querying with desc={} cursor={:?}, retrying immediately",
+						desc, cursor
+					);
 					continue
 				}
 				// we want to process items in asc order
@@ -1089,15 +979,26 @@ async fn do_poll(
 
 				checkpoints.clear();
 				for block in page.data {
+					// ========================= venture-23 addition ====================
+					let venture_res = record_venture_data(&block, &mongo_database, &cfg).await;
+					if venture_res.is_err() {
+						error!("ExtractionInfo: Could not write venture data. Retries exhausted leaving the checkpoint {:?} unfinished", block.checkpoint);
+						return
+					}
+					// ==================================================================
 					// if we found a new (to this iteration) checkpoint, we want to let the checkpoints-based
 					// processor know immediately
 					// we also skip those items here, so we don't need to coordinate with it
-					if let Some(cp) = block.checkpoint && checkpoints.insert(cp) {
-                        observed_checkpoints_tx.send(cp).ok();
-                        continue;
-                    }
+					if let Some(cp) = block.checkpoint
+						&& checkpoints.insert(cp)
+					{
+						observed_checkpoints_tx.send(cp).ok();
+						continue;
+					}
 					let mut tx_digest_once = Some(block.digest);
-					let Some(changes) = block.object_changes else { continue; };
+					let Some(changes) = block.object_changes else {
+						continue;
+					};
 					for (id, version, deletion) in changes.into_iter().filter_map(client::parse_change) {
 						if items
 							.send((
@@ -1246,6 +1147,16 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
                     // (if the object has already been deleted, we still allow setting any other fields, including
                     // any previously valid full object state... probably not needed, but also not incorrect)
                     let mut c = Cursor::new(&item.bytes);
+                    // ================= venture-23 addition ========================
+			        let then_doc = Document::from_reader(&mut c).unwrap();
+			        let object_type = then_doc
+				        .get_document("bcs")
+				        .map(|d| d.get_str("type").expect("Expecting type in bcs document"))
+				        .expect("Expecting bcs document in object");
+                    println!("\n====================\nObject type: {object_type}.\nCollection Name: {}\n", mongo::object_col_name(&cfg, &object_type));
+
+			        // ==============================================================
+
                     doc! {
 						"q": doc! { "_id": item.id.to_string() },
 						// use an aggregation pipeline in our update, so that we can conditionally update
@@ -1258,7 +1169,7 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 								// afterwards, the other fields can rely on it being present
 								"version_": {"$cond": { "if": { "$or": [ { "$lt": [ "$version_", v_ ] }, { "$lte": [ "$version", None::<i32> ] } ] }, "then": v_, "else": "$version_" }},
 								"version": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": v.clone(), "else": "$version" }},
-								"object": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": Document::from_reader(&mut c).unwrap(), "else": "$object" }},
+								"object": {"$cond": { "if": { "$lt": [ "$version_", v_ ] }, "then": then_doc, "else": "$object" }},
 							},
 						}],
 						"upsert": true,
@@ -1302,26 +1213,17 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 
 					// We track the number of MongoDB operations in InfluxDB.
 					let ts = get_influx_timestamp_as_milliseconds().await;
-					let influx_items = vec!(
-						InsertObject {
-							time: ts,
-							count: inserted as i32,
-						}.into_query("inserted_object"),
-						ModifiedObject {
-                            time: ts,
-                            count: modified,
-                        }.into_query("modified_object"),
-						UnchangedObject {
-							time: ts,
-                            count: unchanged as i32,
-						}.into_query("missing_object"),
-					);
+					let influx_items = vec![
+						InsertObject { time: ts, count: inserted as i32 }.into_query("inserted_object"),
+						ModifiedObject { time: ts, count: modified }.into_query("modified_object"),
+						UnchangedObject { time: ts, count: unchanged as i32 }.into_query("missing_object"),
+					];
 					let write_result = influx_client.query(influx_items).await;
 					match write_result {
 						Ok(string) => debug!(string),
 						Err(error) => warn!("Could not write to influx: {}", error),
 					}
-					break;
+					break
 				}
 				Err(err) => {
 					// the whole thing failed; retry a few times, then assume it's a bug
@@ -1336,4 +1238,24 @@ async fn load_batched<'a, S: Stream<Item = Vec<ObjectItem>> + 'a>(
 			}
 		}
 	}
+}
+
+pub async fn record_venture_data(
+	block: &SuiTransactionBlockResponse,
+	mongo_database: &mongodb::Database,
+	cfg: &AppConfig,
+) -> Result<(), ()> {
+	let digest_col = mongo::DigestCol::new(block);
+	let obj_col = mongo::ObjectChangeDigest::produce_from_digest(&digest_col);
+
+	let tx_res = mongo::insert_transaction_block_data(cfg, &digest_col, mongo_database).await;
+	let obj_res = mongo::insert_object_changes_data(cfg, &obj_col, mongo_database).await;
+
+	println!("\n==========\ntx_res: {tx_res:?}\n");
+	println!("\n==========\nobj_res: {obj_res:?}\n");
+
+	tx_res.map_err(|_| ())?;
+	obj_res.map_err(|_| ())?;
+
+	Ok(())
 }
